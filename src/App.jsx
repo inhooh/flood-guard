@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { MapPin, Droplets, Wind, Thermometer, ChevronRight, BarChart3, Info, ShieldAlert, Waves, Server, Activity } from 'lucide-react';
+import { MapPin, Droplets, Wind, Thermometer, ChevronRight, BarChart3, Info, ShieldAlert, Waves, Server, Activity, CloudLightning } from 'lucide-react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, ResponsiveContainer, AreaChart, Area } from 'recharts';
 
 // --- Mock Data ---
@@ -53,7 +53,7 @@ const RiskGauge = ({ riskScore }) => {
   );
 };
 
-const StatItem = ({ icon: Icon, label, value, unit, trend }) => (
+const StatItem = ({ icon: Icon, label, value, unit, trend, subLabel }) => (
   <div className="flex items-center p-4 bg-white rounded-xl shadow-sm border border-slate-100 hover:shadow-md transition-shadow">
     <div className="p-3 bg-blue-50 rounded-lg text-blue-600 mr-4">
       <Icon size={24} />
@@ -65,6 +65,7 @@ const StatItem = ({ icon: Icon, label, value, unit, trend }) => (
         <span className="text-sm text-slate-400 ml-1">{unit}</span>
       </div>
       {trend && <p className="text-xs text-emerald-500 mt-1 font-medium">{trend}</p>}
+      {subLabel && <p className="text-xs text-slate-400 mt-1">{subLabel}</p>}
     </div>
   </div>
 );
@@ -97,8 +98,7 @@ const App = () => {
   // [3단계 핵심] 백엔드(Python)에서 데이터 가져오기
   const fetchFloodRisk = async (location, lat, lon) => {
     try {
-      // ⚠️ 중요: 로컬 주소(http://127.0.0.1...)를 지우고 상대 경로 '/api/predict'만 사용합니다.
-      // 이렇게 하면 Vercel이 자동으로 같은 도메인의 백엔드로 연결합니다.
+      // Vercel 배포 환경: 상대 경로 '/api/predict' 사용
       const response = await fetch('/api/predict', {
         method: 'POST',
         headers: {
@@ -112,18 +112,19 @@ const App = () => {
       }
 
       const data = await response.json();
-      setIsLiveMode(true); // 연결 성공 시 라이브 모드 활성화
+      setIsLiveMode(true); // 연결 성공
       return data;
 
     } catch (error) {
       console.warn("백엔드 연결 실패 (시뮬레이션 모드로 전환):", error);
       setIsLiveMode(false);
       
-      // 연결 실패 시: 기존처럼 시뮬레이션 데이터 반환 (Fallback)
+      // 연결 실패 시: 시뮬레이션 데이터 반환
       return {
         riskScore: Math.floor(Math.random() * 40) + 50,
         waterLevel: (Math.random() * 3 + 1).toFixed(1),
         rainfall: Math.floor(Math.random() * 100) + 50,
+        forecastRain: 0, // 시뮬레이션에선 0
         windSpeed: Math.floor(Math.random() * 20) + 5,
         temperature: Math.floor(Math.random() * 15) + 10,
         comment: "현재 백엔드 서버와 연결할 수 없어 시뮬레이션 데이터를 보여줍니다."
@@ -147,14 +148,14 @@ const App = () => {
       }
 
       // 2. 백엔드(또는 시뮬레이션) 데이터 요청
-      // 딜레이를 살짝 주어 로딩 느낌 구현 (실제 API가 빠르면 삭제 가능)
       await new Promise(resolve => setTimeout(resolve, 800)); 
 
       const result = await fetchFloodRisk(searchTerm, currentCoords.lat, currentCoords.lon);
 
-      // 3. 데이터 적용
+      // 3. 데이터 적용 (forecastRain 추가)
       setWeatherData({
         rainfall: result.rainfall,
+        forecastRain: result.forecastRain || 0, // 미래 예보 값 (없으면 0)
         windSpeed: result.windSpeed,
         temperature: result.temperature,
       });
@@ -217,8 +218,8 @@ const App = () => {
                 당신의 지역은 <span className="text-blue-600">안전한가요?</span>
               </h1>
               <p className="text-lg text-slate-600 mb-10 max-w-2xl mx-auto leading-relaxed">
-                DABAN이 만든 DABAN FloodGuard AI는 고객님들의 안전을 위해 AI 기반의 홍수 위험 예측 시스템으로 
-                현재 위치의 침수 위험도와 실시간 기상 데이터를 분석하여 제공합니다.
+                AI 기반의 홍수 위험 예측 시스템으로 현재 위치의 침수 위험도와 
+                실시간 기상 데이터를 분석하여 제공합니다.
               </p>
             </>
           )}
@@ -307,10 +308,34 @@ const App = () => {
 
             {/* Stats Grid */}
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-              <StatItem icon={Droplets} label="시간당 강수량" value={weatherData.rainfall} unit="mm" trend="▲ 증가세" />
-              <StatItem icon={Waves} label="하천 수위" value={riskData.waterLevel} unit="m" trend="▲ 주의 필요" />
-              <StatItem icon={Wind} label="풍속" value={weatherData.windSpeed} unit="m/s" />
-              <StatItem icon={Thermometer} label="현재 기온" value={weatherData.temperature} unit="°C" />
+              <StatItem 
+                icon={Droplets} 
+                label="현재 강수량" 
+                value={weatherData.rainfall} 
+                unit="mm" 
+                subLabel="실시간 (기상청)"
+              />
+              <StatItem 
+                icon={CloudLightning} 
+                label="향후 예상 강수량" 
+                value={weatherData.forecastRain} 
+                unit="mm" 
+                trend={weatherData.forecastRain > 0 ? "▲ 대비 필요" : "-"} 
+                subLabel="6시간 이내 최대"
+              />
+              <StatItem 
+                icon={Waves} 
+                label="하천 수위" 
+                value={riskData.waterLevel} 
+                unit="m" 
+                trend="▲ 주의 필요" 
+              />
+              <StatItem 
+                icon={Wind} 
+                label="풍속" 
+                value={weatherData.windSpeed} 
+                unit="m/s" 
+              />
             </div>
 
             {/* Charts Row */}
