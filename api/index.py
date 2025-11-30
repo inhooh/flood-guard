@@ -3,8 +3,45 @@ from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timedelta
 import numpy as np
+import os
+import json
+
+# --- Firebase Admin SDK 설정 (DB 연동 준비) ---
+# 라이브러리가 없거나 키가 없어도 서버가 죽지 않도록 예외 처리
+db = None
+try:
+    import firebase_admin
+    from firebase_admin import credentials, firestore
+
+    # 1. Vercel 배포 환경: 환경 변수에서 키를 찾습니다.
+    if os.environ.get('FIREBASE_CREDENTIALS'):
+        # 환경 변수 문자열을 JSON 객체로 변환
+        cred_dict = json.loads(os.environ.get('FIREBASE_CREDENTIALS'))
+        cred = credentials.Certificate(cred_dict)
+        if not firebase_admin._apps:
+            firebase_admin.initialize_app(cred)
+        db = firestore.client()
+        print("🔥 Firebase Firestore 연결 성공 (환경 변수)!")
+        
+    # 2. 로컬 개발 환경: serviceAccountKey.json 파일을 찾습니다.
+    # 주의: 이 파일은 프로젝트 최상위(Root) 폴더에 있어야 합니다.
+    elif os.path.exists('serviceAccountKey.json'):
+        cred = credentials.Certificate('serviceAccountKey.json')
+        if not firebase_admin._apps:
+            firebase_admin.initialize_app(cred)
+        db = firestore.client()
+        print("🔥 Firebase Firestore 연결 성공 (로컬 파일)!")
+        
+    else:
+        print("⚠️ Firebase 키를 찾을 수 없어 '로컬 데이터 모드'로 동작합니다.")
+        
+except ImportError:
+    print("⚠️ firebase-admin 패키지가 설치되지 않았습니다. requirements.txt를 확인하세요.")
+except Exception as e:
+    print(f"⚠️ Firebase 초기화 에러: {e}")
+    print("-> 서버는 '로컬 데이터 모드'로 계속 실행됩니다.")
 
 app = FastAPI()
 
@@ -17,7 +54,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 기상청 API 키 (보내주신 파일에서 추출)
+# 기상청 API 키
 API_KEY = 'c965d7cee76ede7e4be93efd1040a83589b93b4e5c25bd81006e81901d66b809'
 
 # --- 2. 데이터 모델 ---
@@ -26,9 +63,8 @@ class LocationRequest(BaseModel):
     lat: float
     lon: float
 
-# --- 3. 전국 도시 데이터 (data.py 통합) ---
-# 포맷: '구이름': (위도, 경도, 기상청X, 기상청Y, 기본침수심)
-# 검색 편의를 위해 시/도 구분 없이 평탄화하여 처리합니다.
+# --- 3. 전국 도시 데이터 (기본값/백업용) ---
+# DB 연결 실패 시 이 데이터를 사용합니다.
 KOREAN_CITIES_FLAT = {
     # 서울
     '강남구': (37.5172, 127.0474, 61, 126, 0.5),
@@ -59,7 +95,7 @@ KOREAN_CITIES_FLAT = {
     # 부산
     '해운대구': (35.1631, 129.1636, 102, 42, 1.0),
     '부산진구': (35.1628, 129.0532, 100, 42, 0.9),
-    # 주요 도시 추가 (data.py 기반)
+    # 주요 도시 추가
     '수영구': (35.1455, 129.1132, 101, 41, 1.0),
     '분당구': (37.3827, 127.1189, 61, 122, 0.4),
     '일산동구': (37.6777, 126.7489, 56, 129, 0.5),
@@ -68,117 +104,128 @@ KOREAN_CITIES_FLAT = {
     '연수구': (37.4094, 126.6784, 56, 123, 0.2),
 }
 
-# --- 4. 기상청 API 연동 함수 (api.py 통합) ---
+# --- 4. 도시 데이터 검색 헬퍼 함수 ---
+def find_city_data(location_keyword):
+    """
+    1. Firebase DB가 연결되어 있으면 DB에서 검색
+    2. 실패하거나 연결 안 되어 있으면 로컬 Dictionary에서 검색
+    """
+    # 1. DB 검색 시도
+    if db:
+        try:
+            # Firestore에서 모든 도시 문서를 가져와서 매칭 (데이터 양이 적을 때 유효)
+            # 데이터가 많아지면 .where() 쿼리를 사용하는 것이 좋습니다.
+            docs = db.collection('cities').stream()
+            for doc in docs:
+                city = doc.to_dict()
+                # city 문서에는 'name', 'lat', 'lon', 'nx', 'ny', 'base_depth' 필드가 있어야 합니다.
+                if city.get('name') and city.get('name') in location_keyword:
+                    print(f"🔍 DB에서 발견: {city.get('name')}")
+                    return (city['lat'], city['lon'], city['nx'], city['ny'], city['base_depth'])
+        except Exception as e:
+            print(f"⚠️ DB 조회 중 오류 (로컬 데이터로 전환): {e}")
+
+    # 2. 로컬 데이터 검색 (Fallback)
+    for gu_name, data in KOREAN_CITIES_FLAT.items():
+        if gu_name in location_keyword:
+            print(f"🔍 로컬 데이터 발견: {gu_name}")
+            return data
+            
+    return None
+
+# --- 5. 기상청 API 연동 함수 ---
 def get_real_weather(nx, ny):
     """기상청 초단기실황 API 호출"""
     try:
         now = datetime.now()
-        today = now.strftime('%Y%m%d')
-        # 기상청 API는 매시 40분쯤 업데이트되므로, 현재 분이 40분 전이면 1시간 전 데이터를 요청
+        
+        # 45분 이전에는 1시간 전 데이터를 요청 (데이터 생성 시간 고려)
         if now.minute < 45:
-            now_hour = now.hour - 1
+            target_time = now - timedelta(hours=1)
         else:
-            now_hour = now.hour
-            
-        # 시간 포맷 맞추기 (00~23)
-        if now_hour < 0: # 자정 이전 처리
-            now_hour = 23
-            # 날짜도 하루 전으로 돌려야 하지만 복잡하므로 편의상 현재시간 유지하거나
-            # 여기서는 간단히 00시로 고정하는 등 예외처리
-            
-        base_time = f"{now_hour:02d}00"
+            target_time = now
+
+        base_date = target_time.strftime('%Y%m%d')
+        base_time = target_time.strftime('%H00')
         
         url = "http://apis.data.go.kr/1360000/VilageFcstInfoService_2.0/getUltraSrtNcst"
         params = {
             'serviceKey': API_KEY, 
             'pageNo': '1', 
             'numOfRows': '10', 
-            'dataType': 'JSON', # XML보다 JSON이 파싱하기 쉬움
-            'base_date': today, 
+            'dataType': 'JSON', 
+            'base_date': base_date, 
             'base_time': base_time, 
             'nx': str(nx), 
             'ny': str(ny)
         }
         
-        print(f"🌦️ 기상청 요청: {today} {base_time} (격자: {nx}, {ny})")
+        print(f"🌦️ 기상청 요청: {base_date} {base_time} (격자: {nx}, {ny})")
         response = requests.get(url, params=params, timeout=5)
         
         if response.status_code == 200:
-            data = response.json()
-            items = data['response']['body']['items']['item']
-            
-            rain = 0.0
-            temp = 0.0
-            wind = 0.0
-            
-            for item in items:
-                cat = item['category']
-                val = float(item['obsrValue'])
+            try:
+                data = response.json()
+                items = data['response']['body']['items']['item']
                 
-                if cat == 'RN1': # 1시간 강수량
-                    rain = val
-                elif cat == 'T1H': # 기온
-                    temp = val
-                elif cat == 'WSD': # 풍속
-                    wind = val
+                rain = 0.0
+                temp = 0.0
+                wind = 0.0
+                
+                for item in items:
+                    cat = item['category']
+                    val = float(item['obsrValue'])
                     
-            print(f"✅ 날씨 수신 성공: 강수량 {rain}mm, 기온 {temp}도")
-            return rain, temp, wind
+                    if cat == 'RN1': # 1시간 강수량
+                        rain = val
+                    elif cat == 'T1H': # 기온
+                        temp = val
+                    elif cat == 'WSD': # 풍속
+                        wind = val
+                        
+                print(f"✅ 날씨 수신 성공: 강수량 {rain}mm, 기온 {temp}도")
+                return rain, temp, wind
+                
+            except Exception as e:
+                print(f"⚠️ 데이터 파싱 에러: {e}")
+                pass
             
     except Exception as e:
         print(f"⚠️ 기상청 API 에러: {e}")
-        # 에러 시 랜덤값 반환 (앱이 멈추지 않게)
-        return np.random.randint(0, 5), np.random.randint(15, 25), np.random.randint(1, 10)
+    
+    # 에러 발생 시 랜덤값 반환 (시뮬레이션 모드)
+    print("⚠️ API 호출 실패로 시뮬레이션 데이터 반환")
+    return np.random.randint(0, 5), np.random.randint(15, 25), np.random.randint(1, 10)
 
-    return 0, 20, 5 # 기본값
-
-# --- 5. 위험도 계산 로직 (utils.py 통합) ---
+# --- 6. 위험도 계산 로직 ---
 def calculate_flood_risk(rainfall, base_depth, elevation=10):
-    # utils.py의 로직 단순화 적용
-    # 위험도 = (강수량 점수) + (기본 침수심 가중치)
-    
-    # 1. 강수량 점수 (시간당 50mm 넘으면 매우 위험)
     rain_score = min(100, (rainfall / 50) * 100)
-    
-    # 2. 침수심 점수 (도시별 base_depth 반영)
     depth_score = min(50, base_depth * 10)
-    
-    # 3. 최종 점수 (최대 100)
     total_risk = (rain_score * 0.7) + (depth_score * 0.3)
-    
     return min(99, int(total_risk))
 
-# --- 6. API 엔드포인트 ---
-# ⚠️ [핵심 수정] /predict와 /api/predict 두 주소 모두 받도록 설정
+# --- 7. API 엔드포인트 ---
 @app.post("/predict")
 @app.post("/api/predict")
 def predict_flood_risk(request: LocationRequest):
     location_keyword = request.location
     print(f"📡 요청 지역: {location_keyword}")
     
-    # 1. 도시 정보 찾기 (data.py 데이터 활용)
-    city_data = None
-    
-    # 입력된 주소에 '강남', '해운대' 같은 구 이름이 있는지 확인
-    for gu_name, data in KOREAN_CITIES_FLAT.items():
-        if gu_name in location_keyword:
-            city_data = data
-            break
+    # 1. 도시 정보 찾기 (DB -> 로컬 순서로 검색)
+    city_data = find_city_data(location_keyword)
             
     if city_data:
         lat, lon, nx, ny, base_depth = city_data
-        print(f"📍 매칭된 도시: {gu_name} (격자: {nx}, {ny})")
+        print(f"📍 좌표 확인 완료: ({nx}, {ny})")
     else:
-        # 매칭 안되면 서울시청 기준 기본값
         print("⚠️ 도시 매칭 실패, 기본값 사용")
         nx, ny = 60, 127
         base_depth = 0.5
     
-    # 2. 실제 날씨 가져오기 (api.py 기능)
+    # 2. 실제 날씨 가져오기
     rainfall, temp, wind = get_real_weather(nx, ny)
     
-    # 3. 위험도 계산 (utils.py 기능)
-    # 고도는 지도 API에서 못 받아오므로 평균값 15m 가정
+    # 3. 위험도 계산
     risk_score = calculate_flood_risk(rainfall, base_depth, elevation=15)
     
     # 4. 코멘트 생성
@@ -193,7 +240,7 @@ def predict_flood_risk(request: LocationRequest):
 
     return {
         "riskScore": risk_score,
-        "waterLevel": base_depth + (rainfall * 0.01), # 강수량 반영한 수위 시뮬레이션
+        "waterLevel": base_depth + (rainfall * 0.01),
         "rainfall": rainfall,
         "windSpeed": wind,
         "temperature": temp,
