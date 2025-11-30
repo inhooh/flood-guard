@@ -218,7 +218,7 @@ const App = () => {
                 당신의 지역은 <span className="text-blue-600">안전한가요?</span>
               </h1>
               <p className="text-lg text-slate-600 mb-10 max-w-2xl mx-auto leading-relaxed">
-                AI 기반의 홍수 위험 예측 시스템으로 현재 위치의 침수 위험도와 
+                DABAN FloodGuard AI는 DABAN 에서 만든 AI 기반의 홍수 위험 예측 시스템으로 고객님들의 안전을 위해 현재 위치의 침수 위험도와 
                 실시간 기상 데이터를 분석하여 제공합니다.
               </p>
             </>
